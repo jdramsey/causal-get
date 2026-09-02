@@ -18,6 +18,7 @@ typedef struct BIC BIC;
 struct BIC {
   // parameters
   float discount;
+  double tol;      // min improvement, in BIC points, for better_mutation to accept a move
 
   // data
   float *X;
@@ -42,7 +43,7 @@ float get_cov_precomp(BIC *bic, uint32_t a, uint32_t b);
 float get_cov_onfly(BIC *bic, uint32_t a, uint32_t b);
 
 void bic_update(BIC *bic, uint32_t x);
-float bic_score(BIC *bic);
+double bic_score(BIC *bic);
 
 int bic_contains(uint32_t *z, size_t size, uint32_t x);
 int bic_find(uint32_t *z, size_t size, uint32_t x);
@@ -118,14 +119,14 @@ void bic_update(BIC *bic, uint32_t x)
 }
 
 
-float bic_score(BIC *bic)
+double bic_score(BIC *bic)
 {
   bic_update(bic, bic->y);
 
-  float c = bic->discount;                  // discount
-  size_t k = bic->q;                        // num parents
-  float ll = log(bic->D[k]);                // (nll / n) + const
-  float logn = log(bic->n) / (2 * bic->n);  // logn / 2n
+  double c = bic->discount;                            // discount
+  size_t k = bic->q;                                   // num parents
+  double ll = log(bic->D[k]);                          // (nll / n) + const
+  double logn = log((double)bic->n) / (2.0 * bic->n);  // logn / 2n
 
   return ll - c * k * logn;
 }
@@ -163,8 +164,8 @@ void bic_grow(BIC *bic, Bit_Array prefix)
   uint32_t *z = bic->z;
 
   int add = -1;
-  float score;
-  float best = bic_score(bic);
+  double score;
+  double best = bic_score(bic);
 
   while(bic->q < p) {
     for (uint32_t x = 0; x < p; x++) {
@@ -199,8 +200,8 @@ void bic_shrink(BIC *bic)
   uint32_t *z = bic->z;
 
   int del = -1;
-  float score;
-  float best = bic_score(bic);
+  double score;
+  double best = bic_score(bic);
 
   for (size_t size = bic->q - 1; size > 0; size--) {
     for (size_t i = 0; i < size + 1; i++) {

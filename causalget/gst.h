@@ -19,8 +19,11 @@
 #endif // PQ_H_
 
 typedef struct {
+  // shrink_score is what gst_trace returns and what gets summed over all p nodes,
+  // so it carries the order-level decisions and needs double. grow_score is only a
+  // pruning threshold, so it stays float and the node stays 24 bytes (was 20).
+  double shrink_score;
   float grow_score;
-  float shrink_score;
   uint32_t idx;
   uint32_t children;
   uint32_t offset;
@@ -38,11 +41,11 @@ void gst_grow(GST *gst, GST_Node *node, Bit_Array skip, Priority_Queue *pq, BIC 
 // gst_grow calls gst_alloc_nodes which is where this happend. The pointer in the struct is updated.
 
 void gst_alloc_nodes(GST *gst, size_t size);
-void gst_node_init(GST_Node *node, uint32_t idx, float score);
+void gst_node_init(GST_Node *node, uint32_t idx, double score);
 void gst_free(GST *gst);
 
-float gst_next_node(GST *gst, size_t offset, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, BIC *bic);
-float gst_trace(GST *gst, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, BIC *bic);
+double gst_next_node(GST *gst, size_t offset, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, BIC *bic);
+double gst_trace(GST *gst, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, BIC *bic);
 
 #endif // GST_H_
 
@@ -82,9 +85,9 @@ void gst_free(GST *gst)
 }
 
 // This can probably be done inline
-void gst_node_init(GST_Node *node, uint32_t idx, float score)
+void gst_node_init(GST_Node *node, uint32_t idx, double score)
 {
-  node->grow_score = score;
+  node->grow_score = (float)score;
   node->shrink_score = NAN;
   node->idx = idx;
   node->children = 0;
@@ -100,7 +103,7 @@ void gst_grow(GST *gst, GST_Node *node, Bit_Array skip, Priority_Queue *pq, BIC 
     // TODO: FACTORED OUT INTO A FUNCTION CALL IN BIC?
     bic_update(bic, idx);
     bic->z[bic->q++] = idx;
-    float score = bic_score(bic);
+    double score = bic_score(bic);
     bic->q--;
 
     if (node->grow_score < score) {
@@ -120,7 +123,7 @@ void gst_grow(GST *gst, GST_Node *node, Bit_Array skip, Priority_Queue *pq, BIC 
   }
 }
 
-float gst_trace(GST *gst, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, BIC *bic)
+double gst_trace(GST *gst, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, BIC *bic)
 {
   // WHY IS THIS BEING RESET HERE INSTEAD OF OUTSIDE?
   // THIS SHOULD BE PART OF THE SEARCH-STATE STRUCT
@@ -135,7 +138,7 @@ float gst_trace(GST *gst, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, 
   return gst_next_node(gst, 0, prefix, skip, pq, bic);
 }
 
-float gst_next_node(GST *gst, size_t offset, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, BIC *bic)
+double gst_next_node(GST *gst, size_t offset, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, BIC *bic)
 {
   GST_Node *node = gst->root + offset;
   // WHAT IF THE ROOT NODE DOES NOT ADD ANY PARENTS?
@@ -161,10 +164,12 @@ float gst_next_node(GST *gst, size_t offset, Bit_Array prefix, Bit_Array skip, P
     node->shrink_score = bic_score(bic);
   }
 
+#ifdef CG_VERBOSE
   // CHECK INF --- THIS CHECK COULD/SHOULD BE BETTER
   if (isinf(node->shrink_score)) {
     printf("%f\n", node->shrink_score);
   }
+#endif
 
   // THIS RETURNS THE CORRECT SCORE VALUE BUT THE BIC 
   // PARENTS ARE THE RESULTS OF GROW AND NOT GROW SHRINK

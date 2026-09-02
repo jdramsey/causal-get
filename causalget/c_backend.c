@@ -67,7 +67,7 @@ typedef struct {
   int varg2;
   int varg3;
 } Opt;
-int ex_func_(int arg, Opt opt)
+int ex_func_(int arg, Opt opt);
 #define ex_func(arg, ...) ex_func_(arg, (Opt) { __VA_ARGS__ })
 
 
@@ -100,10 +100,11 @@ static PyObject *boss_from_cov(PyObject *self, PyObject *args, PyObject *kw)
   float discount = 1.0;
   uint32_t restarts = 1;
   uint32_t seed = 0;
+  double tol = BOSS_TOL_BIC;
 
-  static char *kwlist[] = {"cov", "knowledge", "discount", "restarts", "seed", NULL};
+  static char *kwlist[] = {"cov", "knowledge", "discount", "restarts", "seed", "tol", NULL};
 
-  if (!PyArg_ParseTupleAndKeywords(args, kw, "y*y*|fII", kwlist, &cov_view, &knwl_view, &discount, &restarts, &seed)) {
+  if (!PyArg_ParseTupleAndKeywords(args, kw, "y*y*|fIId", kwlist, &cov_view, &knwl_view, &discount, &restarts, &seed, &tol)) {
     return NULL;
   }
 
@@ -150,7 +151,7 @@ static PyObject *boss_from_cov(PyObject *self, PyObject *args, PyObject *kw)
   double *L = malloc(sizeof(double) * TNU(p));
   double *D = malloc(sizeof(double) * p);
   uint32_t *z = malloc(sizeof(uint32_t) * p);
-  BIC bic = { discount, cov, n, p, get_cov_precomp, L, D, 0, 0, z };
+  BIC bic = { discount, tol, cov, n, p, get_cov_precomp, L, D, 0, 0, z };
 
   Bit_Array prefix = bta_alloc(p);
   Bit_Array skip = bta_alloc(p);
@@ -182,20 +183,15 @@ static PyObject *boss_from_cov(PyObject *self, PyObject *args, PyObject *kw)
 
 
 
-  // RANDOM RESTARTS ARE BEING IGNORED!
- 
-
-  // graphs are being passed and calculated in boss/sp
-  // but not used in this function?
+  // Restored: this path ran sp_search from the identity order and ignored `restarts`.
+  // boss_restarts is the random-restart wrapper around boss_search_alt; it is
+  // suborder-aware, so the knowledge branch below can use it unchanged.
 
   if (!knwl.num_groups) {
-    printf("HERHEHREHRHEHREHRHE\n");    
     // IF NO KNOWLEDGE
     for (size_t i = 0; i < p; i++) order[i] = i;
-    // shuffle(order, p);
     Py_BEGIN_ALLOW_THREADS
-    // boss_search_alt(&bic, order, p, gsts, prefix, skip, &pq, tmp);
-    sp_search(&bic, order, p, gsts, prefix, skip, &pq, tmp);
+    boss_restarts(&bic, order, p, restarts, gsts, prefix, skip, &pq);
     Py_END_ALLOW_THREADS
   } else {
     // IF KNOWLEDGE
@@ -204,10 +200,8 @@ static PyObject *boss_from_cov(PyObject *self, PyObject *args, PyObject *kw)
     uint32_t *suborder = order;
     for (size_t i = 0; i < knwl.num_groups; i++) {
       size_t sub_p = knwl.group_sizes[i];
-      shuffle(suborder, sub_p);
       Py_BEGIN_ALLOW_THREADS
-      // boss_search_alt(&bic, suborder, sub_p, gsts, prefix, skip, &pq, tmp);
-      sp_search(&bic, suborder, sub_p, gsts, prefix, skip, &pq, tmp);
+      boss_restarts(&bic, suborder, sub_p, restarts, gsts, prefix, skip, &pq);
       Py_END_ALLOW_THREADS
 
       // current suborder is added to prefix
@@ -217,9 +211,11 @@ static PyObject *boss_from_cov(PyObject *self, PyObject *args, PyObject *kw)
     }
   }
 
-  printf("\n\n\n");
-  for (size_t i = 0; i <p; i++) printf(" %u", order[i]);
-  printf("\n\n\n");
+#ifdef CG_VERBOSE
+  printf("order:");
+  for (size_t i = 0; i < p; i++) printf(" %u", order[i]);
+  printf("\n");
+#endif
 
   // WE SHOULD NOT HAVE TO RECALCULATE THE PARENTS
   bta_reset(prefix);
@@ -297,10 +293,11 @@ static PyObject *boss_from_data(PyObject *self, PyObject *args, PyObject *kw)
   float discount = 1.0;
   uint32_t restarts = 1;
   uint32_t seed = 0;
+  double tol = BOSS_TOL_BIC;
 
-  static char *kwlist[] = {"data", "knowledge", "discount", "restarts", "seed", NULL};
+  static char *kwlist[] = {"data", "knowledge", "discount", "restarts", "seed", "tol", NULL};
 
-  if (!PyArg_ParseTupleAndKeywords(args, kw, "y*y*|fII", kwlist, &data_view, &knwl_view, &discount, &restarts, &seed)) {
+  if (!PyArg_ParseTupleAndKeywords(args, kw, "y*y*|fIId", kwlist, &data_view, &knwl_view, &discount, &restarts, &seed, &tol)) {
     return NULL;
   }
 
@@ -329,7 +326,7 @@ static PyObject *boss_from_data(PyObject *self, PyObject *args, PyObject *kw)
   // TEMPORARY SOLUTION!
   uint8_t *tmp = malloc(sizeof(uint8_t) * p * p);
 
-  BIC bic = { discount, data, n, p, get_cov_onfly, L, D, 0, 0, z };
+  BIC bic = { discount, tol, data, n, p, get_cov_onfly, L, D, 0, 0, z };
 
   // ADD KNOWLEDGE TO THIS CALL!
   Py_BEGIN_ALLOW_THREADS

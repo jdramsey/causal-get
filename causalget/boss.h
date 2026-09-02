@@ -1,6 +1,16 @@
 #ifndef BOSS_H_ 
 #define BOSS_H_
 
+// Minimum improvement required before better_mutation will accept a move,
+// expressed in BIC POINTS. bic_score returns BIC/(2n), so the old hard-coded
+// 1e-3 in score units was 2.0 BIC points at n=1000 and 10.0 at n=5000 -- a
+// floor that grew linearly with sample size. Dividing by 2n makes it scale-free.
+// This is now a runtime parameter (BIC.tol, exposed as boss(..., tol=...)); the macro
+// only supplies the default, so a sweep needs one build and a Python loop.
+#ifndef BOSS_TOL_BIC
+#define BOSS_TOL_BIC 1e-2
+#endif
+
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -41,11 +51,16 @@ typedef struct {
 } Search_State;
 
 
-bool better_mutation(uint32_t *order, size_t p, uint32_t *ptr, GST *gsts, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, BIC *bic, float *scores);
+bool better_mutation(uint32_t *order, size_t p, uint32_t *ptr, GST *gsts, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, BIC *bic, double *scores);
 
 void shuffle(uint32_t *arr, size_t size);
 
-void boss_search_alt(BIC *bic, uint32_t *order, size_t p, GST *gsts, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, uint8_t *graph);
+size_t boss_search_alt(BIC *bic, uint32_t *order, size_t p, GST *gsts, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, uint8_t *graph);
+
+// Random-restart wrapper around boss_search_alt. Works on a suborder, so it is
+// safe to call once per knowledge group. Leaves `order` holding the best order
+// found and leaves `prefix` exactly as it found it.
+void boss_restarts(BIC *bic, uint32_t *order, size_t p, size_t restarts, GST *gsts, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq);
 
 void boss_search(BIC *bic, size_t restarts, uint8_t *graph);
 
@@ -79,14 +94,14 @@ void shuffle(uint32_t *arr, size_t size)
 // *ptr is a pointer to the position
 
 // the difference here is that we take a point to the starting position in the suborder and a length of the suborder
-bool better_mutation(uint32_t *order, size_t p, uint32_t *ptr, GST *gsts, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, BIC *bic, float *scores)
+bool better_mutation(uint32_t *order, size_t p, uint32_t *ptr, GST *gsts, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, BIC *bic, double *scores)
 {
   uint32_t *first = order;
   uint32_t *last = order + p - 1;
 
   // scores and order become iterators
 
-  float *best = scores + p - 1;                // best is set to be the final score?
+  double *best = scores + p - 1;                // best is set to be the final score?
 
   // THE PREFIX NEEDS TO BE RESET TO A PARTICULAR STATE FOR SUBORDERS TO WORK
   // IF ITS JUST HANDLED OUTSIDE THEN NO WORRIES
@@ -138,8 +153,7 @@ bool better_mutation(uint32_t *order, size_t p, uint32_t *ptr, GST *gsts, Bit_Ar
   size_t i = ptr - order; // current location (in memory)
   size_t j = best - scores; // best location (in memory)
 
-  // THIS IS A BIT OF A HACK (NEEDS TO BE 1e-3 BETTER THAN CURRENT)
-  if (scores[i] + 1e-3 > *best) return false;
+  if (scores[i] + bic->tol / (2.0 * bic->n) > *best) return false;
 
   // printf("   score: %.4f -> %.4f\n", scores[i], scores[j]); // added for debugging
 
@@ -171,8 +185,11 @@ bool better_mutation(uint32_t *order, size_t p, uint32_t *ptr, GST *gsts, Bit_Ar
 // CURRENTLY I AM PASSING ONE IN BUT IT IS NOT BEING USED
 
 
-void boss_search_alt(BIC *bic, uint32_t *order, size_t p, GST *gsts, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, uint8_t *graph)
+size_t boss_search_alt(BIC *bic, uint32_t *order, size_t p, GST *gsts, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq, uint8_t *graph)
 {
+  (void)graph;
+  size_t sweeps = 0;
+
 
   // THERE SHOULD BE A SEARCH STRUCT THAT CONTAINS THESE THREE THINGS + A BIC SCORE
   // THESE ARE THE DATA REQUIRES TO USE A GST IN SEARCH (AGAIN + A BIC SCORE)
@@ -185,7 +202,7 @@ void boss_search_alt(BIC *bic, uint32_t *order, size_t p, GST *gsts, Bit_Array p
   uint32_t *itr = malloc(sizeof(uint32_t) * p);
 
   // WILL NEED ONE PER SUBORDER
-  float *scores = malloc(sizeof(float) * p);
+  double *scores = malloc(sizeof(double) * p);
   
   // PTR POINTS AT THE (ITH VARIABLE IN THE FROZEN ORDER)'S LOCATION IN ORDER 
   uint32_t *ptr;
@@ -199,8 +216,10 @@ void boss_search_alt(BIC *bic, uint32_t *order, size_t p, GST *gsts, Bit_Array p
     // ITR ONLY NEED TO BE A COPY OF THE SUBORDER 
     for (size_t i = 0; i < p; i++) itr[i] = order[i];
 
-    // verbose output: new bm loop begins
+    sweeps++;
+#ifdef CG_VERBOSE
     printf("better mutation...\n");
+#endif
 
     // THIS SETS PREFIX TO BE EMPTY, BUT IT SHOULD INCLUDE ALL MEMBERS OF PRIOR SUBORDERS
     // bta_reset(prefix); 
@@ -221,6 +240,45 @@ void boss_search_alt(BIC *bic, uint32_t *order, size_t p, GST *gsts, Bit_Array p
 
   free(itr);
 
+  return sweeps;
+}
+
+
+void boss_restarts(BIC *bic, uint32_t *order, size_t p, size_t restarts, GST *gsts, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq)
+{
+  if (restarts < 1) restarts = 1;
+
+  uint32_t *best = malloc(sizeof(uint32_t) * p);
+  double best_score = 0.0;
+  size_t sweeps = 0;
+
+  for (size_t r = 0; r < restarts; r++) {
+    // the first pass runs from the incoming order so a single restart is deterministic
+    if (r) shuffle(order, p);
+
+    sweeps += boss_search_alt(bic, order, p, gsts, prefix, skip, pq, NULL);
+
+    // score the resulting order under the current prefix, then put the prefix back
+    double score = 0.0;
+    for (size_t j = 0; j < p; j++) {
+      score += gst_trace(gsts + order[j], prefix, skip, pq, bic);
+      bta_set(prefix, order[j]);
+    }
+    for (size_t j = 0; j < p; j++) bta_clear(prefix, order[j]);
+
+    if (r == 0 || score > best_score) {
+      best_score = score;
+      for (size_t j = 0; j < p; j++) best[j] = order[j];
+    }
+  }
+
+  for (size_t j = 0; j < p; j++) order[j] = best[j];
+  free(best);
+
+#ifdef CG_VERBOSE
+  printf("boss_restarts: p=%zu restarts=%zu sweeps=%zu best_score=%.8f (BIC %.3f)\n",
+         p, restarts, sweeps, best_score, best_score * 2.0 * bic->n);
+#endif
 }
 
 
@@ -263,14 +321,14 @@ void boss_search(BIC *bic, size_t restarts, uint8_t *graph)
 
 
   // will need one per suborder
-  float *scores = malloc(sizeof(float) * p);
+  double *scores = malloc(sizeof(double) * p);
   
   uint32_t *ptr;
 
   GST *gsts = malloc(sizeof(GST) * p);
   for (size_t i = 0; i < p; i++) gst_init(gsts + i, i, bic);
 
-  float best_score;
+  double best_score;
   bool improved;
 
   for (size_t i = 0; i < restarts; i++) {
@@ -284,7 +342,9 @@ void boss_search(BIC *bic, size_t restarts, uint8_t *graph)
     do {
       for (size_t j = 0; j < p; j++) itr[j] = order[j];
 
+#ifdef CG_VERBOSE
       printf("better mutation...\n");
+#endif
 
       // this sets prefix to be empty, but it should include all members of prior suborders
       bta_reset(prefix); 
@@ -300,7 +360,7 @@ void boss_search(BIC *bic, size_t restarts, uint8_t *graph)
    
     // GET THE SCORE OF THE CURRENT ORDER
     // THIS SHOULD BE DONE BETTER
-    float score = 0;
+    double score = 0;
     bta_reset(prefix);
     for (size_t j = 0; j < p; j++) {
       score += gst_trace(gsts + order[j], prefix, skip, &pq, bic);
@@ -324,17 +384,17 @@ void boss_search(BIC *bic, size_t restarts, uint8_t *graph)
     }
   }
 
-  // WE SHOULD NOT HAVE TO RECALCULATE THE PARENTS
-  // (commented out because its calculated outside)
-  // bta_reset(prefix);
-  // for (size_t i = 0; i < p; i++) {
-  //   gst_trace(gsts + best[i], prefix, skip, &pq, bic);
-  //   bic_shrink(bic);
-  //   bta_set(prefix, best[i]);
-  //   for (size_t j = 0; j < bic->q; j++) {
-  //     graph[best[i] * p + bic->z[j]] = 1;
-  //   }
-  // }
+  // Restored: nothing outside this function fills the graph, so with this block
+  // commented out boss_from_data returned an empty edge list.
+  bta_reset(prefix);
+  for (size_t i = 0; i < p; i++) {
+    gst_trace(gsts + best[i], prefix, skip, &pq, bic);
+    bic_shrink(bic);
+    bta_set(prefix, best[i]);
+    for (size_t j = 0; j < bic->q; j++) {
+      graph[best[i] * p + bic->z[j]] = 1;
+    }
+  }
 
   free(scores);
 

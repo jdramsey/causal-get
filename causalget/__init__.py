@@ -11,29 +11,20 @@ from .c_backend import (
 )
 
 
-def worker_bfc(cov_buf, knwl_buf, discount, restarts, seed, ret):
-  parameters = []
-  parameters.append(cov_buf)
-  parameters.append(knwl_buf)
-  parameters.append(float(discount))
-  parameters.append(int(restarts))
-  if seed is not None: parameters.append(seed)
-  blob = boss_from_cov(*parameters) 
-  ret["blob"] = blob
+def _kwargs(discount, restarts, seed, tol):
+  kw = dict(discount=float(discount), restarts=int(restarts), tol=float(tol))
+  if seed is not None: kw["seed"] = int(seed)
+  return kw
 
-def worker_bfd(data_buff, knwl_buf, discount, restarts, seed, ret):
-  parameters = []
-  parameters.append(data_buf)
-  parameters.append(knwl_buf)
-  parameters.append(float(discount))
-  parameters.append(int(restarts))
-  if seed is not None: parameters.append(seed)
-  blob = boss_from_data(*parameters) 
-  ret["blob"] = blob
+def worker_bfc(cov_buf, knwl_buf, discount, restarts, seed, tol, ret):
+  ret["blob"] = boss_from_cov(cov_buf, knwl_buf, **_kwargs(discount, restarts, seed, tol))
+
+def worker_bfd(data_buf, knwl_buf, discount, restarts, seed, tol, ret):
+  ret["blob"] = boss_from_data(data_buf, knwl_buf, **_kwargs(discount, restarts, seed, tol))
 
 
 # currently ignoring knowledge
-def boss(data, n=None, discount=1.0, restarts=1, knowledge=None, seed=None):
+def boss(data, n=None, discount=1.0, restarts=1, knowledge=None, seed=None, tol=1e-2):
   '''
   Runs the Best Order Score Serch (BOSS).
 
@@ -45,6 +36,7 @@ def boss(data, n=None, discount=1.0, restarts=1, knowledge=None, seed=None):
   restarts = speficies the number of random restarts
   knowledge = dictionary mapping uints (zero is forbid within) to list of strings
   seed = used to set the random seed
+  tol = min improvement, in BIC points, for a transposition to be accepted
 
   Returns
   -------
@@ -65,33 +57,32 @@ def boss(data, n=None, discount=1.0, restarts=1, knowledge=None, seed=None):
   ret = {}
 
   if isinstance(n, int) and isinstance(data, np.ndarray):
-    print("boss from cov")
     _, p = data.shape
     R = data.astype(np.float32) # float32
     cov_buf = struct.pack(byte_order + "II", n, p)
     cov_buf += R.tobytes()
-    thread = threading.Thread(target=worker_bfc, args=(cov_buf, knwl_buf, discount, restarts, seed, ret)) 
+    thread = threading.Thread(target=worker_bfc, args=(cov_buf, knwl_buf, discount, restarts, seed, tol, ret)) 
 
   elif isinstance(data, np.ndarray):
-    print("boss from data")
     n, p = data.shape
     X = data.astype(np.float32).T # float32 transposed 
     data_buf = struct.pack(byte_order + "II", n, p)
     data_buf += X.tobytes()
-    thread = threading.Thread(target=worker_bfd, args=(data_buf, knwl_buf, discount, restarts, seed, ret)) 
+    thread = threading.Thread(target=worker_bfd, args=(data_buf, knwl_buf, discount, restarts, seed, tol, ret)) 
 
   elif isinstance(data, pd.DataFrame):
-    print("boss from cov")
+    # n and p were never assigned on this branch, so boss(DataFrame) raised UnboundLocalError
+    n, p = data.shape
     R = data.corr().astype(np.float32).values # float32
     cov_buf = struct.pack(byte_order + "II", n, p)
     cov_buf += R.tobytes()
-    thread = threading.Thread(target=worker_bfc, args=(cov_buf, knwl_buf, discount, restarts, seed, ret)) 
+    thread = threading.Thread(target=worker_bfc, args=(cov_buf, knwl_buf, discount, restarts, seed, tol, ret)) 
     # print("boss from data")
     # n, p = data.shape
     # X = data.astype(np.float32).values.T # float32 transposed
     # data_buf = struct.pack(byte_order + "II", n, p)
     # data_buf += X.tobytes()
-    # thread = threading.Thread(target=worker_bfd, args=(cov_buf, knwl_buf, discount, restarts, seed, ret)) 
+    # thread = threading.Thread(target=worker_bfd, args=(cov_buf, knwl_buf, discount, restarts, seed, tol, ret)) 
 
   else:
     # replace with raise
