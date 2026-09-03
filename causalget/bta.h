@@ -20,6 +20,7 @@ void bta_reset(Bit_Array bta);
 void bta_set(Bit_Array bta, size_t idx);
 void bta_clear(Bit_Array bta, size_t idx);
 bool bta_check(Bit_Array bta, size_t idx);
+void bta_or(Bit_Array dst, Bit_Array src);
 
 #endif // BTA_H_
 
@@ -63,6 +64,12 @@ bool bta_check(Bit_Array bta, size_t idx)
 {
   assert((idx + 7u) >> 3 <= bta.size);
   return bta.bits[idx >> 3] & (1u << (idx & 7u));
+}
+
+void bta_or(Bit_Array dst, Bit_Array src)
+{
+  assert(dst.size == src.size);
+  for (size_t i = 0; i < dst.size; i++) dst.bits[i] |= src.bits[i];
 }
 
 #endif // BTA_IMPLEMENTATION

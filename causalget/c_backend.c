@@ -75,6 +75,48 @@ int ex_func_(int arg, Opt opt);
 
 
 // MOVE THIS SOMEWHERE ELSE
+// Expands the group-level forbidden triples (a, b, type) into one Bit_Array of forbidden parents per
+// variable: type bit 1 forbids every member of a from being a parent of any member of b, bit 2 the
+// reverse. Returns NULL when there are no triples so the search pays nothing in the common case.
+Bit_Array *build_forbidden_masks(Knowledge *knwl, size_t p)
+{
+  if (knwl->forbidden.num_edges == 0) return NULL;
+
+  size_t *offset = malloc(sizeof(size_t) * (knwl->num_groups + 1));
+  offset[0] = 0;
+  for (size_t g = 0; g < knwl->num_groups; g++) offset[g + 1] = offset[g] + knwl->group_sizes[g];
+
+  Bit_Array *masks = malloc(sizeof(Bit_Array) * p);
+  for (size_t v = 0; v < p; v++) masks[v] = bta_alloc(p);
+
+  for (size_t e = 0; e < knwl->forbidden.num_edges; e++) {
+    Edge t = knwl->forbidden.edges[e];
+    uint32_t a = t.i, b = t.j, type = t.edge;
+    if (a >= knwl->num_groups || b >= knwl->num_groups) continue;
+    if (type & 1) {  // a -> b forbidden: members of a cannot parent members of b
+      for (size_t x = offset[a]; x < offset[a + 1]; x++)
+        for (size_t y = offset[b]; y < offset[b + 1]; y++)
+          if (knwl->group_members[x] != knwl->group_members[y])
+            bta_set(masks[knwl->group_members[y]], knwl->group_members[x]);
+    }
+    if (type & 2) {  // b -> a forbidden
+      for (size_t x = offset[b]; x < offset[b + 1]; x++)
+        for (size_t y = offset[a]; y < offset[a + 1]; y++)
+          if (knwl->group_members[x] != knwl->group_members[y])
+            bta_set(masks[knwl->group_members[y]], knwl->group_members[x]);
+    }
+  }
+  free(offset);
+  return masks;
+}
+
+void free_forbidden_masks(Bit_Array *masks, size_t p)
+{
+  if (!masks) return;
+  for (size_t v = 0; v < p; v++) bta_free(masks[v]);
+  free(masks);
+}
+
 void parse_knowledge(Knowledge *knwl, u_int32_t *itr)
 {
   knwl->num_groups = *itr++;
@@ -159,6 +201,8 @@ static PyObject *boss_from_cov(PyObject *self, PyObject *args, PyObject *kw)
 
   GST *gsts = malloc(sizeof(GST) * p);
   for (size_t i = 0; i < p; i++) gst_init(gsts + i, i, &bic);
+  Bit_Array *forbidden_masks = build_forbidden_masks(&knwl, p);
+  if (forbidden_masks) for (size_t i = 0; i < p; i++) gsts[i].forbidden = forbidden_masks[i];
 
   // MOVED HERE FROM THE BOSS CALL
   uint32_t *order = malloc(sizeof(uint32_t) * p);
@@ -238,6 +282,7 @@ static PyObject *boss_from_cov(PyObject *self, PyObject *args, PyObject *kw)
 
   // freeing GST
   for (size_t i = 0; i < p; i++) gst_free(gsts + i);
+  free_forbidden_masks(forbidden_masks, p);
   free(gsts);
 
   

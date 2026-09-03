@@ -33,6 +33,10 @@ typedef struct {
   size_t size;
   size_t cap;
   GST_Node *root;
+  // Variables that may never be parents of this tree's root (forbidden knowledge). bits == NULL means
+  // none. OR'd into `skip` at the top of every trace, so the tree simply never considers them; the
+  // cache stays consistent because the set is fixed for the life of the search.
+  Bit_Array forbidden;
 } GST;
 
 void gst_init(GST *gst, uint32_t root_idx, BIC *bic);
@@ -55,6 +59,8 @@ void gst_init(GST *gst, uint32_t idx, BIC *bic)
 {
   gst->size = 0;
   gst->cap = 0;
+  gst->forbidden.size = 0;
+  gst->forbidden.bits = NULL;
   gst_alloc_nodes(gst, 1);
 
   bic->y = idx;
@@ -128,9 +134,9 @@ double gst_trace(GST *gst, Bit_Array prefix, Bit_Array skip, Priority_Queue *pq,
   // WHY IS THIS BEING RESET HERE INSTEAD OF OUTSIDE?
   // THIS SHOULD BE PART OF THE SEARCH-STATE STRUCT
   // (ALONG WITH PQ AND BIC)
-  // KNOWLEDGE IMPLEMENTED HERE... ADD FORBIDDEN TO SKIP
   bta_reset(skip);
   bta_set(skip, gst->root->idx);
+  if (gst->forbidden.bits) bta_or(skip, gst->forbidden);
 
   bic->y = gst->root->idx;
   bic->q = 0;
