@@ -115,6 +115,8 @@ def boss(data, n=None, discount=1.0, restarts=1, knowledge=None, seed=None, tol=
 
   if isinstance(n, int) and isinstance(data, np.ndarray):
     _, p = data.shape
+    if not np.isfinite(data).all():
+      raise ValueError("correlation matrix contains NaN or inf")
     R = data.astype(np.float32) # float32
     cov_buf = struct.pack(byte_order + "II", n, p)
     cov_buf += R.tobytes()
@@ -130,6 +132,8 @@ def boss(data, n=None, discount=1.0, restarts=1, knowledge=None, seed=None, tol=
   elif isinstance(data, pd.DataFrame):
     # n and p were never assigned on this branch, so boss(DataFrame) raised UnboundLocalError
     n, p = data.shape
+    if not np.isfinite(data.values).all():
+      raise ValueError("data contains NaN or inf")
     R = data.corr().astype(np.float32).values # float32
     cov_buf = struct.pack(byte_order + "II", n, p)
     cov_buf += R.tobytes()

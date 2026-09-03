@@ -1,6 +1,12 @@
 #ifndef BIC_H_
 #define BIC_H_
 
+// Floor on the residual variance in bic_update (see the comment there). 1e-12 corresponds to a
+// partial R^2 of 1 - 1e-12, i.e. a numerically exact linear dependence.
+#ifndef BIC_MIN_RESID_VAR
+#define BIC_MIN_RESID_VAR 1e-12
+#endif
+
 #include <stdlib.h>
 #include <math.h>
 
@@ -113,8 +119,12 @@ void bic_update(BIC *bic, uint32_t x)
   for (size_t k = 0; k < i; k++) {
     D[i] -= GET(L, i, k) * GET(L, i, k);
   }
-  // CHECK HERE FOR SIGULARITY
-  // CLIP THIS?
+  // D[i] is the residual variance of y given the parents added so far (on standardized data, in (0, 1]).
+  // A numerically singular correlation matrix -- exploding or collinear series, more variables than
+  // rows -- drives it to zero or slightly negative, and 1/sqrt then gives inf or NaN. NaN scores never
+  // compare as improvements, so better_mutation's do/while can fail to terminate. Clamp at a floor that
+  // is far below anything a real residual reaches; the score stays finite and the search converges.
+  if (!(D[i] > BIC_MIN_RESID_VAR)) D[i] = BIC_MIN_RESID_VAR;
   D[i] = 1.0 / sqrt(D[i]);
 }
 
