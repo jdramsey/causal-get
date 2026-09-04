@@ -139,14 +139,22 @@ static PyObject *boss_from_cov(PyObject *self, PyObject *args, PyObject *kw)
   Py_buffer cov_view;
   Py_buffer knwl_view;
 
+  // Optional basis-function embedding: `offsets` is p+1 uint32 column offsets, in which case the
+  // cov header's second field is the number of embedded COLUMNS m and the search runs over the
+  // p = len(offsets)-1 variables with Tetrad's BasisFunctionBicScore. Absent, it is plain linear BIC.
+  Py_buffer offs_view;
+  offs_view.buf = NULL;
+  offs_view.obj = NULL;
+
   float discount = 1.0;
   uint32_t restarts = 1;
   uint32_t seed = 0;
   double tol = BOSS_TOL_BIC;
+  double lambda = 0.0;
 
-  static char *kwlist[] = {"cov", "knowledge", "discount", "restarts", "seed", "tol", NULL};
+  static char *kwlist[] = {"cov", "knowledge", "discount", "restarts", "seed", "tol", "offsets", "lambda", NULL};
 
-  if (!PyArg_ParseTupleAndKeywords(args, kw, "y*y*|fIId", kwlist, &cov_view, &knwl_view, &discount, &restarts, &seed, &tol)) {
+  if (!PyArg_ParseTupleAndKeywords(args, kw, "y*y*|fIIdy*d", kwlist, &cov_view, &knwl_view, &discount, &restarts, &seed, &tol, &offs_view, &lambda)) {
     return NULL;
   }
 
@@ -159,10 +167,24 @@ static PyObject *boss_from_cov(PyObject *self, PyObject *args, PyObject *kw)
   
   itr = cov_view.buf;
   uint32_t n = *itr++;
-  uint32_t p = *itr++;
-  float *cov = (float *)itr;
+  uint32_t m = *itr++;
+  double *cov = (double *)itr;  // 8-byte header, so the doubles are aligned
 
-  // printf("%u %u\n", n, p);
+  uint32_t *offsets = NULL;
+  uint32_t p = m;
+  if (offs_view.buf != NULL && offs_view.len >= (Py_ssize_t)(2 * sizeof(uint32_t))) {
+    offsets = (uint32_t *)offs_view.buf;
+    p = (uint32_t)(offs_view.len / sizeof(uint32_t)) - 1;
+    if (offsets[0] != 0 || offsets[p] != m) {
+      PyErr_SetString(PyExc_ValueError, "offsets must start at 0 and end at the number of embedded columns");
+      PyBuffer_Release(&offs_view);
+      PyBuffer_Release(&cov_view);
+      PyBuffer_Release(&knwl_view);
+      return NULL;
+    }
+  }
+
+  // printf("%u %u %u\n", n, p, m);
 
   itr = knwl_view.buf;
   Knowledge knwl = {0};
@@ -190,10 +212,16 @@ static PyObject *boss_from_cov(PyObject *self, PyObject *args, PyObject *kw)
 
 
   // MAKE BIC INIT / ALLOC AND FREE FUNCTIONS?
-  double *L = malloc(sizeof(double) * TNU(p));
-  double *D = malloc(sizeof(double) * p);
+  // The LDL has one row per embedded column, so it is sized by m, not p.
+  double *L = malloc(sizeof(double) * TNU(m));
+  double *D = malloc(sizeof(double) * m);
+  double *res = malloc(sizeof(double) * m);
+  double *bvec = malloc(sizeof(double) * m);
+  uint32_t *cols = malloc(sizeof(uint32_t) * m);
   uint32_t *z = malloc(sizeof(uint32_t) * p);
-  BIC bic = { discount, tol, cov, n, p, get_cov_precomp, L, D, 0, 0, z };
+  BIC bic = { .discount = discount, .tol = tol, .lambda = lambda, .X = cov, .n = n, .p = p, .m = m,
+              .offsets = offsets, .get_cov = get_cov_precomp, .L = L, .D = D, .res = res, .b = bvec,
+              .cols = cols, .q = 0, .y = 0, .z = z };
 
   Bit_Array prefix = bta_alloc(p);
   Bit_Array skip = bta_alloc(p);
@@ -294,6 +322,9 @@ static PyObject *boss_from_cov(PyObject *self, PyObject *args, PyObject *kw)
   // freeing components of BIC
   free(L);
   free(D);
+  free(res);
+  free(bvec);
+  free(cols);
   free(z);
 
   EdgeList graph = {0};
@@ -313,6 +344,7 @@ static PyObject *boss_from_cov(PyObject *self, PyObject *args, PyObject *kw)
   free(tmp);
   free(graph.edges);
 
+  if (offs_view.obj != NULL) PyBuffer_Release(&offs_view);
   PyBuffer_Release(&cov_view);
   PyBuffer_Release(&knwl_view);
 
@@ -356,7 +388,7 @@ static PyObject *boss_from_data(PyObject *self, PyObject *args, PyObject *kw)
   itr = data_view.buf;
   uint32_t n = *itr++;
   uint32_t p = *itr++;
-  float *data = (float *)itr;
+  double *data = (double *)itr;
 
   // printf("%u %u\n", n, p);
 
@@ -366,12 +398,16 @@ static PyObject *boss_from_data(PyObject *self, PyObject *args, PyObject *kw)
 
   double *L = malloc(sizeof(double) * TNU(p));
   double *D = malloc(sizeof(double) * p);
+  double *res = malloc(sizeof(double) * p);
+  uint32_t *cols = malloc(sizeof(uint32_t) * p);
   uint32_t *z = malloc(sizeof(uint32_t) * p);
 
   // TEMPORARY SOLUTION!
   uint8_t *tmp = malloc(sizeof(uint8_t) * p * p);
 
-  BIC bic = { discount, tol, data, n, p, get_cov_onfly, L, D, 0, 0, z };
+  BIC bic = { .discount = discount, .tol = tol, .lambda = 0.0, .X = data, .n = n, .p = p, .m = p,
+              .offsets = NULL, .get_cov = get_cov_onfly, .L = L, .D = D, .res = res, .b = NULL,
+              .cols = cols, .q = 0, .y = 0, .z = z };
 
   // ADD KNOWLEDGE TO THIS CALL!
   Py_BEGIN_ALLOW_THREADS
@@ -380,6 +416,8 @@ static PyObject *boss_from_data(PyObject *self, PyObject *args, PyObject *kw)
 
   free(L);
   free(D);
+  free(res);
+  free(cols);
   free(z);
 
   // THE CURRENTLY RETURNED GRAPH OBJECT IS A TMP SOLUTION
@@ -407,9 +445,78 @@ static PyObject *boss_from_data(PyObject *self, PyObject *args, PyObject *kw)
 }
 
 
+// Local score of variable y given parents z, from a covariance in the same layout boss_from_cov
+// takes. Exists so the C scorer can be checked against Tetrad's BasisFunctionBicScore / SemBicScore
+// directly, without going through a search. Returns Tetrad BIC units: 2*sum(lik) - c*dof*log(n),
+// including the -n(log 2 pi + 1) per-child-column constant that Tetrad's SemBicScore.getLikelihood
+// carries, so the number should agree with Tetrad's localScore to floating-point precision.
+static PyObject *local_score(PyObject *self, PyObject *args, PyObject *kw)
+{
+  (void)self;
+
+  Py_buffer cov_view;
+  Py_buffer offs_view;
+  Py_buffer parents_view;
+  offs_view.buf = NULL;
+  offs_view.obj = NULL;
+
+  uint32_t y;
+  float discount = 1.0;
+  double lambda = 0.0;
+
+  static char *kwlist[] = {"cov", "y", "parents", "discount", "lambda", "offsets", NULL};
+
+  if (!PyArg_ParseTupleAndKeywords(args, kw, "y*Iy*|fdy*", kwlist, &cov_view, &y, &parents_view, &discount, &lambda, &offs_view)) {
+    return NULL;
+  }
+
+  uint32_t *itr = cov_view.buf;
+  uint32_t n = *itr++;
+  uint32_t m = *itr++;
+  double *cov = (double *)itr;
+
+  uint32_t *offsets = NULL;
+  uint32_t p = m;
+  if (offs_view.buf != NULL && offs_view.len >= (Py_ssize_t)(2 * sizeof(uint32_t))) {
+    offsets = (uint32_t *)offs_view.buf;
+    p = (uint32_t)(offs_view.len / sizeof(uint32_t)) - 1;
+  }
+
+  size_t q = parents_view.len / sizeof(uint32_t);
+  uint32_t *parents = (uint32_t *)parents_view.buf;
+
+  double *L = malloc(sizeof(double) * TNU(m));
+  double *D = malloc(sizeof(double) * m);
+  double *res = malloc(sizeof(double) * m);
+  double *bvec = malloc(sizeof(double) * m);
+  uint32_t *cols = malloc(sizeof(uint32_t) * m);
+  uint32_t *z = malloc(sizeof(uint32_t) * p);
+  BIC bic = { .discount = discount, .tol = 0.0, .lambda = lambda, .X = cov, .n = n, .p = p, .m = m,
+              .offsets = offsets, .get_cov = get_cov_precomp, .L = L, .D = D, .res = res, .b = bvec,
+              .cols = cols, .q = 0, .y = y, .z = z };
+
+  for (size_t i = 0; i < q; i++) {
+    bic_update(&bic, parents[i]);
+    bic.z[bic.q++] = parents[i];
+  }
+  double score = bic_score(&bic);
+
+  size_t k = bic_col_hi(&bic, y) - bic_col_lo(&bic, y);
+  double result = score * 2.0 * n - (double)n * (double)k * (log(2.0 * 3.14159265358979323846) + 1.0);
+
+  free(L); free(D); free(res); free(bvec); free(cols); free(z);
+  if (offs_view.obj != NULL) PyBuffer_Release(&offs_view);
+  PyBuffer_Release(&cov_view);
+  PyBuffer_Release(&parents_view);
+
+  return PyFloat_FromDouble(result);
+}
+
+
 static PyMethodDef methods[] = {
   { "boss_from_cov", (PyCFunction)(void(*)(void))boss_from_cov, METH_VARARGS | METH_KEYWORDS, "runs boss from cov..." },
   { "boss_from_data", (PyCFunction)(void(*)(void))boss_from_data, METH_VARARGS | METH_KEYWORDS, "runs boss from data..." },
+  { "local_score", (PyCFunction)(void(*)(void))local_score, METH_VARARGS | METH_KEYWORDS, "local BIC / BF-BIC score of y given parents..." },
   { NULL, NULL, 0, NULL }
 };
 

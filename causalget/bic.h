@@ -25,28 +25,61 @@ struct BIC {
   // parameters
   float discount;
   double tol;      // min improvement, in BIC points, for better_mutation to accept a move
+  double lambda;   // singularity lambda (Tetrad's SemBicScore.setLambda): the regression coefficients are
+                   // ridge, b = (Sigma_BB + lambda I)^-1 sigma_By, but the residual variance is the true
+                   // residual variance of y - b'x under the UNregularized covariance, as in
+                   // SemBicScore.getResidualVariance: bStar' Cov bStar. See bic_update.
 
   // data
-  float *X;
+  double *X;       // covariance (m x m, row-major) or data (m x n, variable-major), see get_cov
   size_t n;
-  size_t p;
+  size_t p;        // number of search VARIABLES (what BOSS/GST permute and pick parents from)
+  size_t m;        // number of embedded COLUMNS (== p for plain linear BIC)
 
-  // covariance
-  float (*get_cov) (BIC *bic, uint32_t a, uint32_t b);
+  // Basis-function embedding: variable v owns columns offsets[v] .. offsets[v+1]-1 of the
+  // covariance. NULL means the identity embedding (column v is variable v). With a non-trivial
+  // embedding the local score is Tetrad's BasisFunctionBicScore: the chain-rule (joint Gaussian)
+  // BIC of the child's block given the union of the parents' blocks.
+  uint32_t *offsets;
 
-  // LDL
+  // covariance (indexed by COLUMN, not variable)
+  double (*get_cov) (BIC *bic, uint32_t a, uint32_t b);
+
+  // LDL, one row per embedded column of the current parent set (in z order), followed by the
+  // rows of the child block. Rows are addressed by column position, not variable position.
   double *L;
-  double *D;
-  size_t q;
+  double *D;       // 1/sqrt(regularized residual variance) per row, used to factor later rows
+  double *res;     // residual variance per row (Tetrad's definition), what the score is computed from
+  double *b;       // scratch (m) for the back-substitution when lambda > 0
+  uint32_t *cols;  // embedded column id of each row
+  size_t q;        // number of parent VARIABLES currently in z
 
   // indices
   uint32_t y;
   uint32_t *z;
 };
 
+// Block bounds of variable v.
+static inline uint32_t bic_col_lo(const BIC *bic, uint32_t v) { return bic->offsets ? bic->offsets[v] : v; }
+static inline uint32_t bic_col_hi(const BIC *bic, uint32_t v) { return bic->offsets ? bic->offsets[v + 1] : v + 1; }
 
-float get_cov_precomp(BIC *bic, uint32_t a, uint32_t b);
-float get_cov_onfly(BIC *bic, uint32_t a, uint32_t b);
+// LDL row at which the block of parent slot i (0 <= i <= q) begins, i.e. the number of embedded
+// columns contributed by z[0..i). O(i); i is a parent-set size so this is negligible next to the
+// O(rows^2) factor update itself.
+static inline size_t bic_row_start(const BIC *bic, size_t i)
+{
+  if (!bic->offsets) return i;
+  size_t r = 0;
+  for (size_t j = 0; j < i; j++) r += bic->offsets[bic->z[j] + 1] - bic->offsets[bic->z[j]];
+  return r;
+}
+
+// Total embedded columns in the current parent set z[0..q).
+static inline size_t bic_parent_cols(const BIC *bic) { return bic_row_start(bic, bic->q); }
+
+
+double get_cov_precomp(BIC *bic, uint32_t a, uint32_t b);
+double get_cov_onfly(BIC *bic, uint32_t a, uint32_t b);
 
 void bic_update(BIC *bic, uint32_t x);
 double bic_score(BIC *bic);
@@ -62,22 +95,22 @@ void bic_shrink(BIC *bic);
 #ifdef BIC_IMPLEMENTATION
 
 
-float get_cov_precomp(BIC *bic, uint32_t a, uint32_t b)
+double get_cov_precomp(BIC *bic, uint32_t a, uint32_t b)
 {
-  return bic->X[a * bic->p + b];
+  return bic->X[a * bic->m + b];
 }
 
 
-float get_cov_onfly(BIC *bic, uint32_t a, uint32_t b)
+double get_cov_onfly(BIC *bic, uint32_t a, uint32_t b)
 {
   size_t n = bic->n;
-  if (n < 2) return 0.0f;
+  if (n < 2) return 0.0;
 
-  float *x = &bic->X[a * n];
-  float *y = &bic->X[b * n];
+  double *x = &bic->X[a * n];
+  double *y = &bic->X[b * n];
 
-  float mu_x = 0.0f;
-  float mu_y = 0.0f;
+  double mu_x = 0.0;
+  double mu_y = 0.0;
   for (size_t i = 0; i < n; i++) {
     mu_x += x[i];
     mu_y += y[i];
@@ -85,7 +118,7 @@ float get_cov_onfly(BIC *bic, uint32_t a, uint32_t b)
   mu_x /= n;
   mu_y /= n;
 
-  float cov_xy = 0.0f;
+  double cov_xy = 0.0;
   for (size_t i = 0; i < n; i++) {
     cov_xy += (x[i] - mu_x) * (y[i] - mu_y);
   }
@@ -95,50 +128,94 @@ float get_cov_onfly(BIC *bic, uint32_t a, uint32_t b)
 }
 
 
+// Appends the block of variable x as the next rows of the LDL, given the parents z[0..q).
+// Each column of the block is factored against every earlier row, including the block's own
+// earlier columns -- that within-block conditioning is what makes the summed residual
+// log-variances telescope to log det of the conditional covariance of the block, i.e. a joint
+// Gaussian likelihood (and hence a score-equivalent BIC). With the identity embedding this is
+// exactly the original one-row update.
 void bic_update(BIC *bic, uint32_t x)
 {
   double *L = bic->L;
   double *D = bic->D;
-  size_t i = bic->q;
+  uint32_t *cols = bic->cols;
+  size_t row = bic_row_start(bic, bic->q);
 
-  uint32_t *z = bic->z;
-
-  for (size_t j = 0; j < i; j++) {
-    //double acc = X[x * p + z[j]];
-    double acc = bic->get_cov(bic, x, z[j]);
-    for (size_t k = 0; k < j; k++) {
-      acc -= GET(L, i, k) * GET(L, j, k);
+  for (uint32_t c = bic_col_lo(bic, x); c < bic_col_hi(bic, x); c++, row++) {
+    for (size_t j = 0; j < row; j++) {
+      double acc = bic->get_cov(bic, c, cols[j]);
+      for (size_t k = 0; k < j; k++) {
+        acc -= GET(L, row, k) * GET(L, j, k);
+      }
+      GET(L, row, j) = acc * D[j];
     }
-    GET(L, i, j) = acc * D[j];
-  }
 
-  // D[i] = X[p * x + x];
-  D[i] = bic->get_cov(bic, x, x);
+    // Residual variance of column c given all earlier rows (on standardized data, in (0, 1]).
+    // Accumulated in the same order as the original single-row code so that the linear
+    // (identity-embedding) path is bit-identical to it.
+    double res = bic->get_cov(bic, c, c);
+    for (size_t k = 0; k < row; k++) {
+      res -= GET(L, row, k) * GET(L, row, k);
+    }
 
-  // THE SUM OF SQUARES MUST BE LESS THAN ONE
-  for (size_t k = 0; k < i; k++) {
-    D[i] -= GET(L, i, k) * GET(L, i, k);
+    // Tetrad's ridge residual. With L the Cholesky factor of (Sigma_BB + lambda I) and w = L^-1 sigma
+    // (the L entries of this row), the ridge coefficients are b = L^-T w and Tetrad's residual
+    //   sigma_yy - 2 b'sigma + b'Sigma_BB b  =  sigma_yy - w'w - lambda ||b||^2,
+    // since b'Sigma_BB b = b'(Sigma_BB + lambda I) b - lambda ||b||^2 = w'w - lambda ||b||^2.
+    // The res computed above is sigma_yy - w'w; one back-substitution gives the correction.
+    if (bic->lambda > 0.0 && row > 0) {
+      double *b = bic->b;
+      double bb = 0.0;
+      for (size_t k = row; k-- > 0;) {
+        double acc = GET(L, row, k);
+        for (size_t j = k + 1; j < row; j++) acc -= GET(L, j, k) * b[j];
+        b[k] = acc * D[k];
+        bb += b[k] * b[k];
+      }
+      res -= bic->lambda * bb;
+    }
+
+    // A numerically singular correlation matrix -- exploding or collinear series, more variables than
+    // rows -- drives it to zero or slightly negative, and 1/sqrt then gives inf or NaN. NaN scores never
+    // compare as improvements, so better_mutation's do/while can fail to terminate. Clamp at a floor that
+    // is far below anything a real residual reaches; the score stays finite and the search converges.
+    if (!(res > BIC_MIN_RESID_VAR)) res = BIC_MIN_RESID_VAR;
+    bic->res[row] = res;
+
+    // The regularized pivot is what later rows are factored against: adding lambda here is the same
+    // as inverting (Sigma_BB + lambda I) in every regression that has this column as a regressor.
+    // With lambda == 0 this is exactly the original D[i]. (The pivot needs sigma_yy - w'w + lambda,
+    // not the Tetrad residual above, which is why it is recomputed from the L row.)
+    double dreg = bic->get_cov(bic, c, c) + bic->lambda;
+    for (size_t k = 0; k < row; k++) dreg -= GET(L, row, k) * GET(L, row, k);
+    if (!(dreg > BIC_MIN_RESID_VAR)) dreg = BIC_MIN_RESID_VAR;
+    D[row] = 1.0 / sqrt(dreg);
+    cols[row] = c;
   }
-  // D[i] is the residual variance of y given the parents added so far (on standardized data, in (0, 1]).
-  // A numerically singular correlation matrix -- exploding or collinear series, more variables than
-  // rows -- drives it to zero or slightly negative, and 1/sqrt then gives inf or NaN. NaN scores never
-  // compare as improvements, so better_mutation's do/while can fail to terminate. Clamp at a floor that
-  // is far below anything a real residual reaches; the score stays finite and the search converges.
-  if (!(D[i] > BIC_MIN_RESID_VAR)) D[i] = BIC_MIN_RESID_VAR;
-  D[i] = 1.0 / sqrt(D[i]);
 }
 
 
+// Local score of y given z[0..q), in units of (Tetrad BIC) / (2n) up to an additive constant
+// that depends only on the block sizes: Tetrad's 2*sum(lik) - c*dof*log(n) with
+// lik = -n/2 (log(2 pi sigma^2) + 1) and dof = number of regressors, summed over the child's
+// columns in chain-rule order (column t is regressed on the parents' columns plus the t earlier
+// columns of its own block). Constant dropped: -n/2 (log 2 pi + 1) per child column.
 double bic_score(BIC *bic)
 {
   bic_update(bic, bic->y);
 
   double c = bic->discount;                            // discount
-  size_t k = bic->q;                                   // num parents
-  double ll = log(bic->D[k]);                          // (nll / n) + const
+  size_t b = bic_parent_cols(bic);                     // parent columns
+  size_t k = bic_col_hi(bic, bic->y) - bic_col_lo(bic, bic->y); // child columns
   double logn = log((double)bic->n) / (2.0 * bic->n);  // logn / 2n
 
-  return ll - c * k * logn;
+  // log(1/sqrt(res)) rather than -0.5*log(res): same value, but the former is what the original
+  // code computed (via D), and keeping it bit-identical keeps the linear path's tie-breaking identical.
+  double ll = 0.0;
+  for (size_t t = 0; t < k; t++) ll += log(1.0 / sqrt(bic->res[b + t]));
+  size_t dof = k * b + (k * (k - 1)) / 2;
+
+  return ll - c * (double)dof * logn;
 }
 
 

@@ -8,16 +8,21 @@ import threading
 from .c_backend import (
   boss_from_cov,
   boss_from_data,
+  local_score as _local_score,
 )
+from .embedding import embed, embedded_correlation
 
 
-def _kwargs(discount, restarts, seed, tol):
+def _kwargs(discount, restarts, seed, tol, offsets=None, lam=0.0):
   kw = dict(discount=float(discount), restarts=int(restarts), tol=float(tol))
   if seed is not None: kw["seed"] = int(seed)
+  if offsets is not None:
+    kw["offsets"] = offsets
+    kw["lambda"] = float(lam)
   return kw
 
-def worker_bfc(cov_buf, knwl_buf, discount, restarts, seed, tol, ret):
-  ret["blob"] = boss_from_cov(cov_buf, knwl_buf, **_kwargs(discount, restarts, seed, tol))
+def worker_bfc(cov_buf, knwl_buf, discount, restarts, seed, tol, ret, offsets=None, lam=0.0):
+  ret["blob"] = boss_from_cov(cov_buf, knwl_buf, **_kwargs(discount, restarts, seed, tol, offsets, lam))
 
 def worker_bfd(data_buf, knwl_buf, discount, restarts, seed, tol, ret):
   ret["blob"] = boss_from_data(data_buf, knwl_buf, **_kwargs(discount, restarts, seed, tol))
@@ -117,14 +122,14 @@ def boss(data, n=None, discount=1.0, restarts=1, knowledge=None, seed=None, tol=
     _, p = data.shape
     if not np.isfinite(data).all():
       raise ValueError("correlation matrix contains NaN or inf")
-    R = data.astype(np.float32) # float32
+    R = np.ascontiguousarray(data, dtype=np.float64)
     cov_buf = struct.pack(byte_order + "II", n, p)
     cov_buf += R.tobytes()
     thread = threading.Thread(target=worker_bfc, args=(cov_buf, knwl_buf, discount, restarts, seed, tol, ret)) 
 
   elif isinstance(data, np.ndarray):
     n, p = data.shape
-    X = data.astype(np.float32).T # float32 transposed 
+    X = np.ascontiguousarray(data.T, dtype=np.float64) # transposed: variable-major
     data_buf = struct.pack(byte_order + "II", n, p)
     data_buf += X.tobytes()
     thread = threading.Thread(target=worker_bfd, args=(data_buf, knwl_buf, discount, restarts, seed, tol, ret)) 
@@ -134,7 +139,7 @@ def boss(data, n=None, discount=1.0, restarts=1, knowledge=None, seed=None, tol=
     n, p = data.shape
     if not np.isfinite(data.values).all():
       raise ValueError("data contains NaN or inf")
-    R = data.corr().astype(np.float32).values # float32
+    R = np.ascontiguousarray(data.corr().values, dtype=np.float64)
     cov_buf = struct.pack(byte_order + "II", n, p)
     cov_buf += R.tobytes()
     thread = threading.Thread(target=worker_bfc, args=(cov_buf, knwl_buf, discount, restarts, seed, tol, ret)) 
@@ -172,3 +177,107 @@ def boss(data, n=None, discount=1.0, restarts=1, knowledge=None, seed=None, tol=
     if e == 1: dag[j, i] = 1
 
   return dag
+
+
+def _run(thread):
+  thread.start()
+  try:
+    while thread.is_alive():
+      thread.join(timeout=0.1)
+  except KeyboardInterrupt:
+    raise
+
+
+def _unpack_dag(blob, p, byte_order):
+  STRUCT_FMT = byte_order + "iii"
+  STRUCT_SIZE = struct.calcsize(STRUCT_FMT)
+  edges = [struct.unpack_from(STRUCT_FMT, blob, offset) for offset in range(0, len(blob), STRUCT_SIZE)]
+  dag = np.zeros([p, p], dtype=np.uint8)
+  for i, j, e in edges:
+    if e == 2: dag[i, j] = 1
+    if e == 1: dag[j, i] = 1
+  return dag
+
+
+def _pack_cov(R, n, byte_order):
+  R = np.ascontiguousarray(R, dtype=np.float64)
+  m = R.shape[0]
+  return struct.pack(byte_order + "II", int(n), int(m)) + R.tobytes()
+
+
+def _pack_offsets(offsets, byte_order):
+  return struct.pack(byte_order + f"{len(offsets)}I", *[int(o) for o in offsets])
+
+
+def boss_bf(data, truncation_limit=3, discount=2.0, restarts=1, knowledge=None, seed=None,
+            tol=1e-2, forbid_within=None, lam=0.0, rank_transform=False, return_embedding=False):
+  '''
+  Runs BOSS with the basis-function BIC (BF-BIC) score, for nonlinear (non-Gaussian-linear)
+  continuous data. Mirrors Tetrad's BasisFunctionBicScore: each variable is expanded into a
+  block of Legendre basis columns (see causalget.embedding), and the local score of a variable
+  given its parents is the joint linear-Gaussian BIC of the child's block given the union of
+  the parents' blocks, computed on the correlation matrix of the embedded data.
+
+  Parameters
+  ----------
+  data = dataset (ndarray / DataFrame), n rows by p continuous columns. A covariance matrix
+         cannot be used here: the embedding needs the raw data.
+  truncation_limit = highest Legendre order per variable (Tetrad's TRUNCATION_LIMIT; default 3)
+  discount = penalty discount (Tetrad's BF-BIC default is 2)
+  lam = singularity lambda, a ridge on the regressor block (Tetrad's SINGULARITY_LAMBDA)
+  rank_transform = rank-transform columns to [-1, 1] before embedding instead of min-max scaling
+                   (Tetrad's BASIS_RANK_TRANSFORM; recommended by Tetrad, off by default to match it)
+  restarts, knowledge, seed, tol, forbid_within = as in boss()
+  return_embedding = also return (offsets, kept_orders)
+
+  Returns
+  -------
+  g = directed acyclic graph over the ORIGINAL p variables (and optionally the embedding info)
+  '''
+  byte_order = "<" if sys.byteorder == "little" else ">"
+
+  if isinstance(data, pd.DataFrame):
+    names = list(data.columns)
+    X = data.values
+  elif isinstance(data, np.ndarray):
+    names = list(range(data.shape[1]))
+    X = data
+  else:
+    raise TypeError("data must be a pandas DataFrame or a numpy ndarray")
+
+  n, p = X.shape
+  knwl_buf = _pack_knowledge(knowledge, names, forbid_within, byte_order)
+
+  R, offsets, orders = embedded_correlation(X, truncation_limit, rank_transform=rank_transform)
+  if not np.isfinite(R).all():
+    raise ValueError("embedded correlation matrix contains NaN or inf")
+
+  cov_buf = _pack_cov(R, n, byte_order)
+  offs_buf = _pack_offsets(offsets, byte_order)
+
+  ret = {}
+  thread = threading.Thread(target=worker_bfc,
+                            args=(cov_buf, knwl_buf, discount, restarts, seed, tol, ret, offs_buf, lam))
+  _run(thread)
+
+  dag = _unpack_dag(ret["blob"], p, byte_order)
+  if return_embedding:
+    return dag, offsets, orders
+  return dag
+
+
+def local_score(R, n, y, parents, discount=2.0, offsets=None, lam=0.0):
+  '''
+  Local score of variable y given `parents`, in Tetrad BIC units (2 * sum(lik) - c * dof * log n,
+  with Tetrad's SemBicScore likelihood constants), computed by the C scorer. With `offsets` this is
+  BF-BIC on an embedded correlation matrix R (see embedded_correlation); without, plain SEM BIC on R.
+  Intended for checking the C scorer against Tetrad's BasisFunctionBicScore / SemBicScore.
+  '''
+  byte_order = "<" if sys.byteorder == "little" else ">"
+  cov_buf = _pack_cov(R, n, byte_order)
+  par_buf = struct.pack(byte_order + f"{len(parents)}I", *[int(v) for v in parents])
+  kw = dict(discount=float(discount))
+  if offsets is not None:
+    kw["offsets"] = _pack_offsets(offsets, byte_order)
+    kw["lambda"] = float(lam)
+  return _local_score(cov_buf, int(y), par_buf, **kw)
