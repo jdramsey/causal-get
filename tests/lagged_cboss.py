@@ -3,6 +3,7 @@ lagged_cboss.py -- run C-BOSS on a time series with lag-tier knowledge and repor
 
     python lagged_cboss.py series.csv --lags 2 --penalty 2 --starts 5
     python lagged_cboss.py series.csv --lags 3 --penalty 3 --starts 10 --star --all-edges --out edges.txt
+    python lagged_cboss.py series.csv --lags 2 --bf-bic --truncation 3 --rank-transform
 
 Input: a delimited file with a header row, one column per variable, one row per time step in order.
 The delimiter is sniffed (comma, tab, semicolon, whitespace). Non-numeric columns are dropped with a
@@ -13,6 +14,12 @@ earlier, so row t of the lagged data is (X_t, X_{t-1}, ..., X_{t-L}). The first 
 Knowledge is the lag tiers -- lag L first, lag 0 last -- which C-BOSS requires to partition the
 variables; they do. A variable at lag k may then only take parents from lags >= k, so no edge points
 backward in time. --star additionally forbids contemporaneous (lag-0 -> lag-0) edges.
+
+Score: linear Gaussian BIC by default. --bf-bic switches to Tetrad's basis-function BIC (BF-BIC) for
+nonlinear dependence: each lagged column is expanded into --truncation Legendre basis columns and the
+search scores blocks (see cg.boss_bf). --rank-transform and --lambda are Tetrad's BASIS_RANK_TRANSFORM
+and SINGULARITY_LAMBDA. The lag tiers and --star apply identically; only the scorer changes. Penalty
+values are not comparable across the two scores (BF-BIC's default in Tetrad is 2).
 
 Output: every edge whose child is a lag-0 variable, "parent --> child", sorted by child then parent.
 Lagged parents are oriented by the tiers; contemporaneous parents are oriented by the search and
@@ -77,6 +84,10 @@ def main():
     ap.add_argument("csv", help="delimited file with a header; one column per variable, rows in time order")
     ap.add_argument("--lags", type=int, required=True, help="number of lags to include")
     ap.add_argument("--penalty", type=float, default=2.0, help="BIC penalty discount")
+    ap.add_argument("--bf-bic", action="store_true", help="score with the basis-function BIC (nonlinear) instead of linear BIC")
+    ap.add_argument("--truncation", type=int, default=3, help="BF-BIC: highest Legendre order per variable")
+    ap.add_argument("--rank-transform", action="store_true", help="BF-BIC: rank-transform columns to [-1, 1] before embedding")
+    ap.add_argument("--lambda", dest="lam", type=float, default=0.0, help="BF-BIC: singularity lambda (ridge)")
     ap.add_argument("--starts", type=int, default=1, help="number of random restarts (local searches)")
     ap.add_argument("--star", action="store_true", help="forbid contemporaneous (lag-0 -> lag-0) edges")
     ap.add_argument("--seed", type=int, default=29)
@@ -103,8 +114,25 @@ def main():
     if not np.isfinite(R).all():
         sys.exit("the lagged correlation matrix has NaN entries (a constant column?)")
 
-    A = np.asarray(cg.boss(lagged, discount=args.penalty, restarts=args.starts, seed=args.seed, tol=args.tol,
-                           knowledge=tiers, forbid_within=forbid_within))
+    if args.bf_bic:
+        if args.truncation < 1:
+            sys.exit("--truncation must be at least 1")
+        A, offsets, orders = cg.boss_bf(lagged, truncation_limit=args.truncation, discount=args.penalty,
+                                        restarts=args.starts, seed=args.seed, tol=args.tol,
+                                        knowledge=tiers, forbid_within=forbid_within,
+                                        lam=args.lam, rank_transform=args.rank_transform, return_embedding=True)
+        A = np.asarray(A)
+        sizes = [int(offsets[i + 1] - offsets[i]) for i in range(len(names))]
+        short = [(names[i], sizes[i]) for i in range(len(names)) if sizes[i] < args.truncation]
+        score_desc = (f"BF-BIC, truncation {args.truncation}" + (", rank-transformed" if args.rank_transform else "")
+                      + (f", lambda {args.lam:g}" if args.lam else "") + f", {int(offsets[-1])} embedded columns")
+        if short:
+            print(f"note: {len(short)} column(s) kept fewer than {args.truncation} basis functions (few distinct values): "
+                  + ", ".join(f"{nm}:{k}" for nm, k in short[:8]) + (" ..." if len(short) > 8 else ""))
+    else:
+        A = np.asarray(cg.boss(lagged, discount=args.penalty, restarts=args.starts, seed=args.seed, tol=args.tol,
+                               knowledge=tiers, forbid_within=forbid_within))
+        score_desc = "linear BIC"
 
     into_lag0 = []
     backward = 0
@@ -118,7 +146,7 @@ def main():
 
     n_lagged = sum(1 for pa, _ in into_lag0 if lag_of(pa) > 0)
     n_contemp = len(into_lag0) - n_lagged
-    print(f"C-BOSS: penalty {args.penalty:g}, {args.starts} start(s), {int(A.sum())} edges in the lagged DAG, "
+    print(f"C-BOSS: {score_desc}, penalty {args.penalty:g}, {args.starts} start(s), {int(A.sum())} edges in the lagged DAG, "
           f"{backward} pointing backward in time" + ("" if backward == 0 else "  <-- should be 0; please report"))
     print(f"edges into lag 0: {len(into_lag0)}  ({n_lagged} from lagged variables, {n_contemp} contemporaneous"
           + (", contemporaneous forbidden" if args.star else "") + ")")
